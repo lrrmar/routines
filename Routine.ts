@@ -1,4 +1,6 @@
 import { scienceTrueAirSpeed } from './utils.ts';
+
+const fullTurnMaxBearingChange = 10;
 type AbstractConstructor<T = unknown> =
   abstract new (...args: any[]) => T;
 
@@ -285,7 +287,7 @@ abstract class Routine implements Routine {
     return classes;
   }
 
-  swappableRoutines() {
+  swappableRoutines(): Routine[] {
     // Provides a list of routine instances that are equivalent to the current one
     return this.equivalentRoutineClasses().map(
       (routineClass) => {
@@ -482,23 +484,37 @@ class CompositeRoutine extends Routine {
 
   }
 
-  pruneNullRoutines() {
+  pruneRoutines() {
     // Remove any null routines that are hanging i.e. their entry or exit state
     // no longer points to them. NullState hanging on the end will be remove 
     // by garbage collection
-    const nullRoutines = this.routines.filter(
-      (routine) => routine instanceof NullRoutine
-    );
-    nullRoutines.forEach((nullRoutine) => {
-      const entry = nullRoutine.getEntryState();
-      const exit = nullRoutine.getExitState();
+    this.routines.forEach((routine) => {
+      const entry = routine.getEntryState();
+      const exit = routine.getExitState();
       if (
-        entry.getEntryForRoutine() !== nullRoutine
-        || exit.getExitForRoutine() !== nullRoutine
+        entry.getEntryForRoutine() !== routine
+        || exit.getExitForRoutine() !== routine
       ) {
-        this.removeRoutine(nullRoutine); 
+        this.removeRoutine(routine); 
       }
     })
+  }
+
+  pullRoutines() {
+    // If there is a routine that state is pointing to that is not
+    // in this.routines then include it, induced by self replacements
+    const states = this.getStateSequence();
+    states.forEach((state) => {
+      const entryForRoutine = state.getEntryForRoutine();
+      const exitForRoutine = state.getExitForRoutine()
+      if (entryForRoutine && !this.routines.includes(entryForRoutine)) {
+        this.includeRoutine(entryForRoutine);
+      }
+      if (exitForRoutine && !this.routines.includes(exitForRoutine)) {
+        this.includeRoutine(exitForRoutine);
+      }
+    })
+
   }
 
   // Handling Automatic Turns Routines
@@ -530,8 +546,30 @@ class CompositeRoutine extends Routine {
         entryState
       );
 
+      // Get the routine that will lead into the turn
+      const previousRoutine = entryState.getExitForRoutine();
+
       // Get the routine that will follow the turn
       const nextRoutine = entryState.getEntryForRoutine();
+
+      // Get bearing change if possible and update TurnClass
+      let TurnClass = InsideTurn;
+      if (
+        previousRoutine instanceof WaypointChangeRoutine
+        && nextRoutine instanceof WaypointChangeRoutine
+      ) {
+        const entryBearing = previousRoutine.getExitBearing();
+        const exitBearing = nextRoutine.getEntryBearing();
+        if (
+          entryBearing !== null
+        && exitBearing !== null
+        && (
+          Math.abs(entryBearing - (exitBearing + 180) % 360) < fullTurnMaxBearingChange
+          )
+        ) {
+          TurnClass = RaceTrackTurn;
+        }
+      }
 
       // remove the entryForRoutine for the entry state as this
       // will be replaced by in inside turn
@@ -552,8 +590,9 @@ class CompositeRoutine extends Routine {
         nextRoutine.fixRoutineToState();
       }
 
+
       // create an inside turn creating them
-      const insideTurn = new InsideTurn(entryState, exitState);
+      const insideTurn = new TurnClass(entryState, exitState);
       this.includeRoutine(insideTurn);
 
     });
@@ -615,7 +654,7 @@ class CompositeRoutine extends Routine {
     // the routines array.
     //
     const index = this.getNewRoutineIndex(newRoutine);
-    if (index !== null) {
+    if (index !== null && !this.routines.includes(newRoutine)) {
       newRoutine.fixRoutineToState();
       this.routines.splice(index, 0 , newRoutine);
     } else {
@@ -654,12 +693,12 @@ abstract class Turn extends BearingChangeRoutine{
 
   fixState(correctState: State, incorrectState: State) {
     incorrectState.waypoint = correctState.waypoint;
-    //incorrectState.altitude = correctState.altitude;
+    incorrectState.altitude = correctState.altitude;
   }
 
   stateCheck() {
     return (
-      super.stateCheck() && this.exitState.altitude == this.exitState.altitude
+      super.stateCheck() && this.entryState.altitude == this.exitState.altitude
     )
   }
 
@@ -672,14 +711,6 @@ abstract class Turn extends BearingChangeRoutine{
       return null;
     }
   }
-
-}
-
-abstract class PartTurn extends Turn {
-  // state check to handle whether a turn is too obtuse to be a part turn?
-}
-
-class InsideTurn extends PartTurn {
   toString() {
     let st = `${this.constructor.name} at ${this.getEntryState().waypoint.name}`;
     const nextRoutine = this.getExitState().getEntryForRoutine();
@@ -690,6 +721,14 @@ class InsideTurn extends PartTurn {
     }
     return st;
   }
+
+}
+
+abstract class PartTurn extends Turn {
+  // state check to handle whether a turn is too obtuse to be a part turn?
+}
+
+class InsideTurn extends PartTurn {
   calculateTime() { 
     return this.bearingChange(); 
   }
@@ -708,6 +747,9 @@ class OutsideTurn extends InsideTurn {
 abstract class FullTurn extends Turn {
 }
 
+class RaceTrackTurn extends FullTurn {
+  calculateTime() { return 4 }
+}
 class ProcedureTurn extends FullTurn {
   calculateTime() { return 4 }
 }
@@ -732,7 +774,15 @@ abstract class WaypointChangeRoutine extends Routine {
 
   toString() {
     let s = this.constructor.name;
-    return `${} from ${this.getEntryState().waypoint.name} to ${this.getExitState().waypoint.name}`;
+    const entryWaypoint = this.getEntryState().waypoint.name;
+    const exitWaypoint = this.getExitState().waypoint.name;
+    if (entryWaypoint) {
+      s += ` from ${entryWaypoint}`;
+    }
+    if (exitWaypoint) {
+      s += ` to ${exitWaypoint}`;
+    }
+    return s;
   }
 
 
@@ -817,15 +867,22 @@ class SLR extends WaypointChangeRoutine {
     return (
       super.stateCheck() && altitudeCheck
     );
- }
+  }
 
- getAltitude() {
+  getAltitude() {
     if (this.getEntryState().altitude != null && this.getExitState().altitude){
       return this.getEntryState().altitude;
     } else {
       return null;
     }
- }
+  }
+
+  setAltitude(newAltitude: number) {
+    this.getEntryState().setAltitude(newAltitude);
+    this.getEntryState().entryUpdate();
+    this.getExitState().setAltitude(newAltitude);
+    this.getExitState().exitUpdate();
+  }
 
  getGroundSpeed(): number | null {
   const altitude = this.getAltitude();
@@ -866,8 +923,25 @@ abstract class Profile extends WaypointChangeRoutine {
     );
   }
 
+  protected InverseProfileClass: typeof ProfileAscent | typeof ProfileDescent | typeof NullRoutine = NullRoutine;
+
   fixState(entry: State, exit: State) {
-    void(0);
+    // Altitude changing in chain could mean that we need to swap between
+    // descent and ascent
+    const entryAltitude = this.getEntryState().altitude;
+    const exitAltitude = this.getExitState().altitude;
+    if (super.stateCheck() && !this.stateCheck()) {
+      // Inherited state succeeded, but this state check failed, therefore
+      // issue in altitudes 
+      const replacement = new this.InverseProfileClass(this.getEntryState(), this.getExitState());
+      replacement.init();
+      if (!(replacement instanceof NullRoutine)) {
+        this.getEntryState().clearEntryForRoutine();
+        this.getExitState().clearExitForRoutine();
+        replacement.fixRoutineToState();
+      }
+
+    }
   }
 
   init() {
@@ -945,14 +1019,17 @@ abstract class Profile extends WaypointChangeRoutine {
 
 class ProfileAscent extends Profile {
 
+  InverseProfileClass = ProfileDescent;
+
   protected altitudeCheck(entryAltitude: number, exitAltitude: number) {
     return entryAltitude <= exitAltitude;
   }
 
 }
 
-
 class ProfileDescent extends Profile {
+
+  InverseProfileClass = ProfileAscent;
 
   protected altitudeCheck(entryAltitude: number, exitAltitude: number) {
     return entryAltitude >= exitAltitude;
@@ -997,7 +1074,7 @@ const routineList: RoutineList = [
 
 const wpA: Waypoint = {'name': 'A', 'latitude': 0, 'longitude': 0};
 const wpB: Waypoint = {'name': 'B', 'latitude': 35, 'longitude': 45};
-const wpC: Waypoint = {'name': 'C', 'latitude': 1, 'longitude': 0};
+const wpC: Waypoint = {'name': 'C', 'latitude': 100, 'longitude': 0};
 const wpD: Waypoint = {'name': 'D', 'latitude': 35, 'longitude': 135};
 const wpE: Waypoint = {'name': 'E', 'latitude': 1, 'longitude': 1};
 
@@ -1014,24 +1091,30 @@ comp.init()
 const slrAB = new SLR(state0, state1);
 slrAB.init()
 comp.includeRoutine(slrAB);
-comp.pruneNullRoutines();
+comp.pruneRoutines();
 comp.injectNullRoutines();
 
 
 const ascentBC = new ProfileAscent(state1, state2);
 ascentBC.init()
 comp.includeRoutine(ascentBC);
-comp.pruneNullRoutines();
+comp.pruneRoutines();
+comp.pullRoutines();
 comp.injectNullRoutines();
 comp.injectMissingTurns();
-comp.injectNullRoutines();
 
 ascentBC.setExitAltitude(12000)
 
-const slrCD = new SLR(state2, state3);
-slrCD.init()
-comp.includeRoutine(slrCD);
-comp.pruneNullRoutines();
+const slrCB = new SLR(state2, state1a);
+slrCB.init()
+comp.includeRoutine(slrCB);
+comp.pruneRoutines();
+comp.pullRoutines();
 comp.injectMissingTurns();
+
+
+slrCB.setAltitude(4000);
+comp.pruneRoutines();
+comp.pullRoutines();
 
 console.log(comp.toString(true))
