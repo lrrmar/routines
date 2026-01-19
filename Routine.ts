@@ -23,6 +23,20 @@ function isSubclassOf<
 }
 
 
+type Measure = {
+  value: number;
+  unit: string;
+}
+type RoutineJson = {
+  routine: string;
+  waypoint0: string;
+  waypoint1?: string;
+  altitude0?: Measure;
+  altitude1?: Measure;
+  time?: Measure;
+}
+
+
 interface State {
   waypoint: Waypoint;
   altitude: number | null;
@@ -68,9 +82,9 @@ class State implements State {
 
   isComplete(): boolean {
     return (
-      this.waypoint == null 
-      && this.altitude == null
-      && this.bearing == null
+      this.waypoint != null 
+      && this.altitude != null
+      && this.bearing != null
     );
   }
 
@@ -166,7 +180,8 @@ abstract class Routine implements Routine {
         this.fixState(this.getEntryState(), this.getExitState());
       }
       if (!this.stateCheck()) {
-        throw new Error('Routine not permitted between states');
+        const error = `Routine ${this.constructor.name} not permitted between states`;
+        throw new Error(error);
       }
   }
 
@@ -197,6 +212,42 @@ abstract class Routine implements Routine {
   
   toString() {
     throw new Error("Not implemented");
+  }
+
+  toJson(): RoutineJson | null {
+    if (
+      !(this instanceof NullRoutine)
+    ) {
+      const altitude0 = this.getEntryState().altitude;
+      const altitude1 = this.getExitState().altitude;
+      const waypoint0 = this.getEntryState().waypoint.name;
+      const waypoint1 = this.getExitState().waypoint.name;
+      const time = this.calculateTime();
+      let json: RoutineJson = {
+        'routine': this.constructor.name,
+        'waypoint0': waypoint0,
+      };
+
+      if (waypoint0 != waypoint1) {
+        json['waypoint1'] = waypoint1;
+      }
+
+      if (altitude0 != null) {
+        json['altitude0'] = {'value': altitude0, 'unit': 'ft'};
+      }
+
+      if (altitude1 != null && altitude0 != altitude1) {
+        json['altitude1'] = {'value': altitude1, 'unit': 'ft'};
+      }
+
+      if (time != null) {
+        json['time'] = {'value': time, 'unit': 'minutes'};
+      }
+
+      return json;
+    } else {
+      return null;
+    }
   }
 
   calculateTime(): number | null {
@@ -271,6 +322,10 @@ abstract class Routine implements Routine {
     throw new Error('Not implemented');
   }
 
+  permittedPreviousRoutineClasses(): RoutineList {
+    return this.permittedNextRoutineClasses(); // for now all are symmetrical
+  }
+
   equivalentRoutineClasses() {
     // Provides a list of routine classes that are equivalent to the current one
     let classes: RoutineList=[];
@@ -317,7 +372,47 @@ abstract class Routine implements Routine {
     this.permittedNextRoutineClasses().forEach((routineClass) => {
       nextRoutines.push(new routineClass(this.getExitState()));
     })
+    const availableNextRoutines: Routine[] = [];
+    nextRoutines.forEach((routine) => {
+      // verify each routine
+      try {
+        routine.init();
+        availableNextRoutines.push(routine);
+      } catch {
+        void(0);
+      }
+    })
     return nextRoutines;
+  }
+
+  availablePreviousRoutines() {
+    // returns a list of possible previous routines instances
+    let previousRoutines: Routine[] = [];
+
+    // Get current previous routine and if it exists create instances of all 
+    // swappable routines i.e. options for keeping state the same but swapping
+    // the routine that connects them
+    const currentPreviousRoutine = this.getEntryState().getExitForRoutine();
+    if (currentPreviousRoutine) {
+      previousRoutines = currentPreviousRoutine.swappableRoutines();
+    }
+
+    // Create instances that exit to null state of ALL possible permitted
+    // routines that follow this one
+    this.permittedPreviousRoutineClasses().forEach((routineClass) => {
+      previousRoutines.push(new routineClass(new State({}), this.getEntryState()));
+    })
+    const availablePreviousRoutines: Routine[] = [];
+    previousRoutines.forEach((routine) => {
+      // verify each routine
+      try {
+        routine.init();
+        availablePreviousRoutines.push(routine);
+      } catch {
+        void(0);
+      }
+    })
+    return previousRoutines;
   }
 
 }
@@ -337,6 +432,7 @@ abstract class BearingChangeRoutine extends Routine {
     })
   }
 
+
   fixRoutineToState() {
     // Similar to WaypointChangeRoutine
     super.fixRoutineToState();
@@ -350,6 +446,7 @@ abstract class BearingChangeRoutine extends Routine {
       this.getExitState().bearing = nextRoutine.getEntryBearing();
     }
   }
+
 }
 
 class CompositeRoutine extends Routine {
@@ -390,6 +487,26 @@ class CompositeRoutine extends Routine {
 
     }
     return s;
+  }
+
+
+  jsonSequence(): RoutineJson[] | null {
+    let sequence: RoutineJson[] = [];
+    try {
+      this.routines.forEach((routine, i) => {
+        console.log(routine)
+        const json = routine.toJson();
+        if (json) {
+          sequence.push(json);
+        } else {
+          throw new Error(`Routine ${i}: ${routine.constructor.name} does not have valid Json`);
+        }
+      })
+      return sequence;
+    } catch (error) {
+      console.log(error);
+      return null;
+    }
   }
 
   stateCheck() {
@@ -485,7 +602,7 @@ class CompositeRoutine extends Routine {
   }
 
   pruneRoutines() {
-    // Remove any null routines that are hanging i.e. their entry or exit state
+    // Remove any routines that are hanging i.e. their entry or exit state
     // no longer points to them. NullState hanging on the end will be remove 
     // by garbage collection
     this.routines.forEach((routine) => {
@@ -497,6 +614,9 @@ class CompositeRoutine extends Routine {
       ) {
         this.removeRoutine(routine); 
       }
+
+      // Remove lone turns
+
     })
   }
 
@@ -596,7 +716,80 @@ class CompositeRoutine extends Routine {
       this.includeRoutine(insideTurn);
 
     });
+  }
 
+  addRoutine(newRoutine: Routine) {
+
+    // Check to see if routine can find a place
+    if (this.getNewRoutineIndex(newRoutine) == null) {
+      throw new Error("This routine cannot be added to the composite, no index")
+    };
+    let entryState: State;
+    let exitState: State;
+    let direction: 'forward' | 'backwards' = 'forward';
+
+    // Find out whether this new routine leads out of (forward) or out
+    // of (backward) a routine currently in the composite
+    if (this.getStateSequence().includes(newRoutine.getEntryState())) {
+      // the new routine leads out of a routine in the composite
+      entryState = newRoutine.getEntryState();
+      exitState = Object.assign(
+        Object.create(Object.getPrototypeOf(entryState)),
+        entryState
+      );
+    } else if (this.getStateSequence().includes(newRoutine.getExitState())) {
+      // the new routine leads into of a routine in the composite
+      exitState = newRoutine.getExitState();
+      entryState = Object.assign(
+        Object.create(Object.getPrototypeOf(exitState)),
+        exitState
+      );
+      direction = 'backwards';
+    } else {
+      throw new Error("This routine cannot be added to the composite")
+    }
+
+    // Get the routine that will lead into the new routine
+    const previousRoutine = entryState.getExitForRoutine();
+
+    // Get the routine that will follow the new routine
+    const nextRoutine = entryState.getEntryForRoutine();
+
+    // remove the entryForRoutine for the entry state as this
+    // will be replaced by the new routine
+    entryState.clearEntryForRoutine();
+
+    // remove the exitForRoutine for the exit state as this
+    // will be replaced by the new routine
+    exitState.clearExitForRoutine();
+
+    if (direction == 'forward') {
+      // remove the entryForRoutine for the exit state as this
+      // needs to be reset to the next routine
+      exitState.clearEntryForRoutine(); //????????????????????
+  
+      // Assign exitState from the InsideTurn to entryState for the following
+      // WaypointChangeRoutine
+      if(nextRoutine) {
+        nextRoutine.setEntryState(exitState);
+        nextRoutine.fixRoutineToState();
+      }
+    } else {
+      // remove the exitForRoutine for the entry state as this
+      // needs to be reset to the previous routine
+      entryState.clearExitForRoutine(); //????????????????????
+  
+      // Assign exitState from the InsideTurn to entryState for the following
+      // WaypointChangeRoutine
+      if(previousRoutine) {
+        previousRoutine.setExitState(entryState);
+        previousRoutine.fixRoutineToState();
+      }
+    }
+
+
+    // create an inside turn creating them
+    this.includeRoutine(newRoutine);
   }
 
   ///////////
@@ -611,6 +804,20 @@ class CompositeRoutine extends Routine {
       throw new Error('Composite does not include this routine');
     }
   }
+
+
+
+  /*replaceRoutine(oldRoutine: Routine, newRoutine: Routine) {
+    // Replace this routine from the composite
+    if (this.routines.includes(oldRoutine)) {
+      if (oldRoutine.getEntryState() !== newRoutine.getEntryState()
+      const index = this.routines.indexOf(oldRoutine);
+      oldRoutine.cleanUpStates();
+      this.routines.splice(index,1);
+    } else {
+      throw new Error('Composite does not include routine to be replace');
+    }
+  }*/
 
   private getNewRoutineIndex(newRoutine: Routine) {
 
@@ -722,6 +929,10 @@ abstract class Turn extends BearingChangeRoutine{
     return st;
   }
 
+  calculateTime() {
+    return 2;
+  }
+
 }
 
 abstract class PartTurn extends Turn {
@@ -729,33 +940,20 @@ abstract class PartTurn extends Turn {
 }
 
 class InsideTurn extends PartTurn {
-  calculateTime() { 
-    return this.bearingChange(); 
-  }
 }
 
 class OutsideTurn extends InsideTurn {
-  calculateTime() { 
-    let insideTime = super.calculateTime();
-    if (insideTime) {
-      insideTime *= 5;
-    }
-    return insideTime;
-  }
 }
 
 abstract class FullTurn extends Turn {
 }
 
 class RaceTrackTurn extends FullTurn {
-  calculateTime() { return 4 }
 }
 class ProcedureTurn extends FullTurn {
-  calculateTime() { return 4 }
 }
 
 class FaamTurn extends FullTurn {
-  calculateTime() { return 5 }
 }
 
 // waypoint change routines
@@ -784,6 +982,7 @@ abstract class WaypointChangeRoutine extends Routine {
     }
     return s;
   }
+
 
 
   fixRoutineToState() {
@@ -1059,6 +1258,22 @@ const routineList: RoutineList = [
   ProfileDescent
 ];
 
+const routineRegister: { 
+  [key: string] : typeof SLR |
+  typeof Transit |
+  typeof OutsideTurn |
+  typeof InsideTurn |
+  typeof ProfileAscent |
+  typeof ProfileDescent  
+} = {
+  'SLR': SLR,
+  'Transit': Transit,
+  'OutsideTurn': OutsideTurn,
+  'InsideTurn': InsideTurn,
+  'ProfileAscent': ProfileAscent,
+  'ProfileDescent': ProfileDescent,
+}
+
 /*class Waypoint {
   private name: string;
   private latitude: number;
@@ -1117,4 +1332,41 @@ slrCB.setAltitude(4000);
 comp.pruneRoutines();
 comp.pullRoutines();
 
-console.log(comp.toString(true))
+const slrBD = new SLR(state1a, state3);
+slrCB.init()
+comp.includeRoutine(slrBD);
+comp.pruneRoutines();
+comp.pullRoutines();
+comp.injectMissingTurns();
+
+const slrDE = new SLR(state3, state4);
+slrDE.init()
+comp.includeRoutine(slrDE);
+comp.pruneRoutines();
+comp.pullRoutines();
+comp.injectMissingTurns();
+
+// Attemping to use addRoutine
+const newRoutine = slrBD.availableNextRoutines().at(2);
+
+console.log(comp.toString());
+
+if (newRoutine) {
+  comp.addRoutine(newRoutine);
+
+  comp.pruneRoutines();
+  comp.pullRoutines();
+  comp.injectNullRoutines();
+  comp.injectMissingTurns();
+
+  const newPreviousRoutine = ascentBC.availablePreviousRoutines().at(2);
+
+  if (newPreviousRoutine) {
+    comp.addRoutine(newPreviousRoutine);
+    comp.pruneRoutines();
+    comp.pullRoutines();
+    comp.injectNullRoutines();
+    comp.injectMissingTurns();
+  } 
+}
+console.log(comp.toString());
