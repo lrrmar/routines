@@ -1,4 +1,13 @@
-import { scienceTrueAirSpeed } from './utils.ts';
+/* hacks
+ *
+ * - calculateTime is not good... need to figure out whether
+ *   or not to force a duration from json and how to change
+ *   it if the routine states are altered
+ * - setting WaypointChangeRoutine and BearingChangeRoutine to
+ *   none-abstract class is lazy, but maybe okay?
+ */
+import { scienceTrueAirSpeed } from './utils';
+import { type RoutineJson, isRoutineName } from './JsonParser';
 
 const fullTurnMaxBearingChange = 10;
 type AbstractConstructor<T = unknown> =
@@ -22,22 +31,61 @@ function isSubclassOf<
   return false;
 }
 
+export class WaypointRegistry {
+  // todo: make into a singleton
+  static waypoints: { [key: string]: Waypoint } = {};
+  static compositeRoutines: CompositeRoutine[] = [];
+  constructor() {
+    const tempWaypointSet: Waypoint[] = [
+      {'name': 'A', 'latitude': 0, 'longitude': 0},
+      {'name': 'B', 'latitude': 35, 'longitude': 45},
+      {'name': 'C', 'latitude': 100, 'longitude': 0},
+      {'name': 'D', 'latitude': 35, 'longitude': 135},
+      {'name': 'E', 'latitude': 1, 'longitude': 1},
+    ];
 
-type Measure = {
-  value: number;
-  unit: string;
+    tempWaypointSet.forEach((waypoint: Waypoint) => {
+      WaypointRegistry.registerNewWaypoint(waypoint);
+    })
+  }
+
+  static registerCompositeRoutine(routine: CompositeRoutine) {
+    this.compositeRoutines.push(routine);
+  }
+
+  static registerNewWaypoint(waypoint: Waypoint) {
+    if (this.waypoints[waypoint.name] != undefined) {
+      throw new Error(`Waypoint ${waypoint.name} already exists`);
+    } else {
+      this.waypoints[waypoint.name] = waypoint;
+    }
+
+  }
+
+  static getActiveWaypoints() {
+    const activeWaypoints: string[] = [];
+    this.compositeRoutines.forEach((routine) => {
+      const stateSequence = routine.getStateSequence();
+      stateSequence.forEach((state: State) => {
+        activeWaypoints.push(state.waypoint.name);
+      })
+    })
+    return [...new Set(activeWaypoints)];
+  }
+
+  static getWaypoint(name: string) {
+    const waypoint = this.waypoints[name];
+    if (waypoint) {
+      return waypoint;
+    } else {
+      return null;
+    }
+  }
 }
-type RoutineJson = {
-  routine: string;
-  waypoint0: string;
-  waypoint1?: string;
-  altitude0?: Measure;
-  altitude1?: Measure;
-  time?: Measure;
-}
 
 
-interface State {
+
+export interface State {
   waypoint: Waypoint;
   altitude: number | null;
   bearing: number | null;
@@ -46,9 +94,13 @@ interface State {
 }
 
 
+type StateConstructor = {
+  waypoint?: Waypoint;
+  altitude?: number;
+  bearing?: number;
+}
 
-
-class State implements State {
+export class State implements State {
 
   public waypoint: Waypoint;
   public altitude: number | null = null;
@@ -57,12 +109,11 @@ class State implements State {
   private exitForRoutine: Routine | null = null;
   private entryForRoutine: Routine | null = null;
 
-  constructor(init:{waypoint?: Waypoint; altitude?: number; bearing?: number}) {
+  constructor(init: StateConstructor) {
     if (init['waypoint']) {
       this.waypoint = init['waypoint'];
     } else {
       this.waypoint  = {name: 'Null', latitude: -9999, longitude: -9999};
-
     }
     if (init['altitude']) this.setAltitude(init['altitude']);
     if (init['bearing']) this.setBearing(init['bearing']);
@@ -74,7 +125,7 @@ class State implements State {
 
   isNull(): boolean {
     return (
-      this.waypoint == null 
+      this.waypoint.name == 'Null' 
       && this.altitude == null
       && this.bearing == null
     );
@@ -140,23 +191,28 @@ class State implements State {
   }
 }
 
-interface Routine {
+export interface Routine {
+  duration: number | null;
   constructor(entry: State, exit: State): void;
   stateCheck(): boolean;
   timeCost(): number;
   fixState(correctState: State, incorrectState: State): void;
   entryUpdate(): void;
   exitUpdate(): void;
+  //fromJson(): Routine;
 }
 
 
 abstract class Routine implements Routine {
   protected entryState: State;
   protected exitState: State;
+  public duration: number | null = null;
   
   constructor(entry: State, exit?: State) {
-    if (entry.isNull()) {
-      throw new Error('Entry state cannot be null');
+    if (exit == undefined && entry.isNull()) {
+      throw new Error('Lone entry state cannot be null');
+    } else if (exit && exit.isNull() && entry.isNull()) {
+      throw new Error('Entry and exit state cannot be null');
     }
     this.entryState = entry;
     if (exit) {
@@ -173,6 +229,10 @@ abstract class Routine implements Routine {
 
   init(): void {
     this.verifyStateConstructor();
+  }
+
+  setDuration(duration: number) {
+    this.duration = duration;
   }
 
   verifyStateConstructor() {
@@ -215,16 +275,18 @@ abstract class Routine implements Routine {
   }
 
   toJson(): RoutineJson | null {
+    const routineName = this.constructor.name
     if (
       !(this instanceof NullRoutine)
+      && isRoutineName(routineName)
     ) {
       const altitude0 = this.getEntryState().altitude;
       const altitude1 = this.getExitState().altitude;
       const waypoint0 = this.getEntryState().waypoint.name;
       const waypoint1 = this.getExitState().waypoint.name;
-      const time = this.calculateTime();
+      const duration = this.calculateDuration();
       let json: RoutineJson = {
-        'routine': this.constructor.name,
+        'routine': routineName,
         'waypoint0': waypoint0,
       };
 
@@ -240,8 +302,8 @@ abstract class Routine implements Routine {
         json['altitude1'] = {'value': altitude1, 'unit': 'ft'};
       }
 
-      if (time != null) {
-        json['time'] = {'value': time, 'unit': 'minutes'};
+      if (duration != null) {
+        json['duration'] = {'value': duration, 'unit': 'minutes'};
       }
 
       return json;
@@ -250,8 +312,18 @@ abstract class Routine implements Routine {
     }
   }
 
-  calculateTime(): number | null {
-    throw new Error("Not implemented")
+  static fromJson(json: RoutineJson) {
+    // Basic checks for waypoint errors
+    if (!WaypointRegistry.getWaypoint(json.waypoint0)) {
+      throw new Error(`Waypoint ${json.waypoint0} is not registered`)
+    }
+    if (json.waypoint1 && !WaypointRegistry.getWaypoint(json.waypoint1)) {
+      throw new Error(`Waypoint ${json.waypoint1} is not registered`)
+    }
+  }
+
+  calculateDuration(): number | null | undefined {
+    if (this.duration != null) return this.duration;
   } // implementin class!
 
   ////////////////////////////
@@ -417,7 +489,7 @@ abstract class Routine implements Routine {
 
 }
 
-abstract class BearingChangeRoutine extends Routine {
+class BearingChangeRoutine extends Routine {
   
   stateCheck() {
     return (
@@ -447,11 +519,52 @@ abstract class BearingChangeRoutine extends Routine {
     }
   }
 
+  static fromJson(json: RoutineJson) {
+    let entryStateInfo: StateConstructor = {};
+
+    // waypoint errors
+    const waypoint0 = WaypointRegistry.getWaypoint(json.waypoint0);
+    if (waypoint0) {
+      entryStateInfo['waypoint'] =  waypoint0;
+    } else {
+      throw new Error(`Waypoint ${json.waypoint0} is not registered`)
+    }
+    if (json.waypoint1) {
+      throw new Error (`${this.constructor.name} requires a single waypoint.`)
+    }
+
+    // altitude
+    const altitude0 = json.altitude0;
+    if (altitude0) {
+      entryStateInfo['altitude'] = altitude0['value'];
+    }
+
+    if (json.altitude1) {
+      throw new Error (`${this.constructor.name} requires a single altitude.`)
+    }
+
+    // Matching since BearingChangeRoutines do not change waypoint or altitude
+    const entryState = new State(entryStateInfo);
+    const exitState = new State(entryStateInfo);
+
+    const routine = new this(entryState, exitState);
+    routine.init()
+
+    const duration = json.duration;
+
+    if (duration != null) {
+      routine.setDuration(duration.value);
+    }
+
+    return routine;
+  }
+
 }
 
-class CompositeRoutine extends Routine {
+export class CompositeRoutine extends Routine {
   
   routineList = [SLR, Transit, OutsideTurn, InsideTurn];
+  private waypointRegistry: WaypointRegistry;
   
   routines: Routine[] = [];
 
@@ -465,24 +578,23 @@ class CompositeRoutine extends Routine {
 
   init() {
     super.init();
-    this.injectNullRoutines();
   }
 
-  toString(times: boolean = false) {
+  toString(durations: boolean = false) {
     let s = '';
     this.routines.forEach((routine) => {
       s += `${routine.toString()}`;
-      if (times) {
-        const t = routine.calculateTime();
+      if (durations) {
+        const t = routine.calculateDuration();
         if (t) s+= `: ${t} minutes`;
         
       }
       s += `\n`;
     });
-    if (times) {
-      const t = this.calculateTime();
+    if (durations) {
+      const t = this.calculateDuration();
       if (t) {
-        s += `Total flight time ${t} minutes\n`
+        s += `Total flight duration ${t} minutes\n`
       }
 
     }
@@ -492,21 +604,15 @@ class CompositeRoutine extends Routine {
 
   jsonSequence(): RoutineJson[] | null {
     let sequence: RoutineJson[] = [];
-    try {
-      this.routines.forEach((routine, i) => {
-        console.log(routine)
-        const json = routine.toJson();
-        if (json) {
-          sequence.push(json);
-        } else {
-          throw new Error(`Routine ${i}: ${routine.constructor.name} does not have valid Json`);
-        }
-      })
-      return sequence;
-    } catch (error) {
-      console.log(error);
-      return null;
-    }
+    this.routines.forEach((routine, i) => {
+      const json = routine.toJson();
+      if (json) {
+        sequence.push(json);
+      } else {
+        void(0);
+      }
+    })
+    return sequence;
   }
 
   stateCheck() {
@@ -538,8 +644,11 @@ class CompositeRoutine extends Routine {
     }
   }
 
-  getStateSequence() {
+  getStateSequence(): State[] {
     let states: State[] = [];
+    if (this.routines.length == 0) {
+      return [this.getEntryState()];
+    }
     this.routines.forEach((routine) => {
       states.push(routine.getEntryState());
       states.push(routine.getExitState());
@@ -551,18 +660,21 @@ class CompositeRoutine extends Routine {
     void(0);
   }
 
-  calculateTime() {
-    let time = 0;
+  calculateDuration() {
+    if (super.calculateDuration() != null) {
+      return super.calculateDuration();
+    };
+    let duration = 0;
     try {
       this.routines.forEach((routine) => {
-        const dt = routine.calculateTime();
+        const dt = routine.calculateDuration();
         if (dt) {
-          time += dt;
+          duration += dt;
         } else {
           throw new Error()
         }
       });
-      return time;
+      return duration;
     } catch {
       return null;
     }
@@ -718,11 +830,19 @@ class CompositeRoutine extends Routine {
     });
   }
 
-  addRoutine(newRoutine: Routine) {
+  appendRoutine(newRoutine: Routine) {
+
+    // A wrapper for includeRoutine which handles the need to replicate some
+    // states when a routine is added between two others
 
     // Check to see if routine can find a place
-    if (this.getNewRoutineIndex(newRoutine) == null) {
-      throw new Error("This routine cannot be added to the composite, no index")
+    if (this.getNewRoutineIndex(newRoutine) === null) {
+      // Add to end of routines list
+      const nullRoutine = new NullRoutine(this.getExitState(), newRoutine.getEntryState());
+      this.includeRoutine(nullRoutine); // need to do this explicitly to account for gap in state
+      this.includeRoutine(newRoutine);
+      this.cleanUp();
+      return
     };
     let entryState: State;
     let exitState: State;
@@ -759,6 +879,7 @@ class CompositeRoutine extends Routine {
     // will be replaced by the new routine
     entryState.clearEntryForRoutine();
 
+
     // remove the exitForRoutine for the exit state as this
     // will be replaced by the new routine
     exitState.clearExitForRoutine();
@@ -790,6 +911,16 @@ class CompositeRoutine extends Routine {
 
     // create an inside turn creating them
     this.includeRoutine(newRoutine);
+
+    this.cleanUp();
+  }
+
+  private cleanUp() {
+    this.injectNullRoutines();
+    this.pullRoutines();
+    this.pruneRoutines();
+    this.injectMissingTurns();
+
   }
 
   ///////////
@@ -885,7 +1016,8 @@ class NullRoutine extends Routine {
     return `No routine between ${this.getEntryState().waypoint.name} and ${this.getExitState().waypoint.name}`;
   }
 
-  calculateTime() {
+  calculateDuration() {
+    super.calculateDuration();
     return null;
   }
 
@@ -929,7 +1061,11 @@ abstract class Turn extends BearingChangeRoutine{
     return st;
   }
 
-  calculateTime() {
+  calculateDuration() {
+    if (super.calculateDuration() != null) {
+      return super.calculateDuration();
+    };
+    super.calculateDuration();
     return 2;
   }
 
@@ -958,7 +1094,7 @@ class FaamTurn extends FullTurn {
 
 // waypoint change routines
 
-abstract class WaypointChangeRoutine extends Routine {
+class WaypointChangeRoutine extends Routine {
 
   stateCheck() {
     return (
@@ -983,7 +1119,53 @@ abstract class WaypointChangeRoutine extends Routine {
     return s;
   }
 
+  static fromJson(json: RoutineJson) {
 
+    let entryStateInfo: StateConstructor = {};
+    let exitStateInfo: StateConstructor = {};
+
+    // waypoint errors
+    const waypoint0 = WaypointRegistry.getWaypoint(json.waypoint0);
+    if (waypoint0) {
+      entryStateInfo['waypoint'] =  waypoint0;
+    } else {
+      throw new Error(`Waypoint ${json.waypoint0} is not registered`)
+    }
+
+    if (json.waypoint1) {
+      const waypoint1 = WaypointRegistry.getWaypoint(json.waypoint1);
+      if (waypoint1) {
+          exitStateInfo['waypoint'] = waypoint1;
+      } else {
+        throw new Error(`Waypoint ${json.waypoint1} is not registered`)
+      }
+    }
+
+    // altitude
+    const altitude0 = json.altitude0;
+    if (altitude0) {
+      entryStateInfo['altitude'] = altitude0['value'];
+    }
+
+    const altitude1 = json.altitude1;
+    if (altitude1) {
+      exitStateInfo['altitude'] = altitude1['value'];
+    }
+
+    const entryState = new State(entryStateInfo);
+    const exitState = new State(exitStateInfo);
+
+    const routine = new this(entryState, exitState);
+    routine.init()
+
+    const duration = json.duration;
+
+    if (duration != null) {
+      routine.setDuration(duration.value);
+    }
+
+    return routine;
+  }
 
   fixRoutineToState() {
     super.fixRoutineToState();
@@ -1092,7 +1274,10 @@ class SLR extends WaypointChangeRoutine {
    }
  }
 
-  calculateTime() { 
+  calculateDuration() { 
+    if (super.calculateDuration() != null) {
+      return super.calculateDuration();
+    };
     const speed = this.getGroundSpeed();
     if (speed != null) {
       return Math.ceil(this.getHaversine() / speed);
@@ -1172,12 +1357,13 @@ abstract class Profile extends WaypointChangeRoutine {
     return s;
   }
 
-  calculateTime() {
-    const time = this.altitudeChange();
-    if (time != null) {
-      return Math.ceil(time / 1000);  // 1000ft /min
+  calculateDuration() {
+    super.calculateDuration();
+    const duration = this.altitudeChange();
+    if (duration != null) {
+      return Math.ceil(duration / 1000);  // 1000ft /min
     }
-    return time;
+    return duration;
   }
 
   setEntryAltitude(newAltitude: number) {
@@ -1258,7 +1444,7 @@ const routineList: RoutineList = [
   ProfileDescent
 ];
 
-const routineRegister: { 
+export const routineRegister: { 
   [key: string] : typeof SLR |
   typeof Transit |
   typeof OutsideTurn |
@@ -1286,6 +1472,7 @@ const routineRegister: {
     this.longitude = longitude;
   }
 }*/
+/*
 
 const wpA: Waypoint = {'name': 'A', 'latitude': 0, 'longitude': 0};
 const wpB: Waypoint = {'name': 'B', 'latitude': 35, 'longitude': 45};
@@ -1304,15 +1491,16 @@ const comp = new CompositeRoutine(state0)
 comp.init()
 
 const slrAB = new SLR(state0, state1);
+
 slrAB.init()
-comp.includeRoutine(slrAB);
+comp.appendRoutine(slrAB);
 comp.pruneRoutines();
 comp.injectNullRoutines();
 
 
 const ascentBC = new ProfileAscent(state1, state2);
 ascentBC.init()
-comp.includeRoutine(ascentBC);
+comp.appendRoutine(ascentBC);
 comp.pruneRoutines();
 comp.pullRoutines();
 comp.injectNullRoutines();
@@ -1322,7 +1510,7 @@ ascentBC.setExitAltitude(12000)
 
 const slrCB = new SLR(state2, state1a);
 slrCB.init()
-comp.includeRoutine(slrCB);
+comp.appendRoutine(slrCB);
 comp.pruneRoutines();
 comp.pullRoutines();
 comp.injectMissingTurns();
@@ -1334,25 +1522,25 @@ comp.pullRoutines();
 
 const slrBD = new SLR(state1a, state3);
 slrCB.init()
-comp.includeRoutine(slrBD);
+comp.appendRoutine(slrBD);
 comp.pruneRoutines();
 comp.pullRoutines();
 comp.injectMissingTurns();
 
 const slrDE = new SLR(state3, state4);
 slrDE.init()
-comp.includeRoutine(slrDE);
+comp.appendRoutine(slrDE);
 comp.pruneRoutines();
 comp.pullRoutines();
 comp.injectMissingTurns();
 
-// Attemping to use addRoutine
+// Attemping to use appendRoutine
 const newRoutine = slrBD.availableNextRoutines().at(2);
 
-console.log(comp.toString());
+
 
 if (newRoutine) {
-  comp.addRoutine(newRoutine);
+  comp.appendRoutine(newRoutine);
 
   comp.pruneRoutines();
   comp.pullRoutines();
@@ -1362,11 +1550,13 @@ if (newRoutine) {
   const newPreviousRoutine = ascentBC.availablePreviousRoutines().at(2);
 
   if (newPreviousRoutine) {
-    comp.addRoutine(newPreviousRoutine);
+    console.log(newPreviousRoutine.getEntryState().isNull());
+    comp.appendRoutine(newPreviousRoutine);
     comp.pruneRoutines();
     comp.pullRoutines();
     comp.injectNullRoutines();
     comp.injectMissingTurns();
   } 
+
 }
-console.log(comp.toString());
+*/
